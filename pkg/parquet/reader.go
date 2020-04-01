@@ -38,6 +38,19 @@ type Reader interface {
 	ReadFile(ctx context.Context, file string) (ReadResults, error)
 }
 
+type ReaderSettings struct {
+	ModelId        mdl.ModelId
+	NamingStrategy string
+}
+
+type ReaderOption func(r *s3Reader)
+
+func ReaderRecorder(recorder FileRecorder) ReaderOption {
+	return func(r *s3Reader) {
+		r.recorder = recorder
+	}
+}
+
 type s3Reader struct {
 	logger   mon.Logger
 	s3Cfg    *aws.Config
@@ -48,7 +61,7 @@ type s3Reader struct {
 	recorder             FileRecorder
 }
 
-func NewReader(config cfg.Config, logger mon.Logger, settings *ReaderSettings) *s3Reader {
+func NewReader(config cfg.Config, logger mon.Logger, settings *ReaderSettings, opts ...ReaderOption) *s3Reader {
 	s3Cfg := blob.GetS3ClientConfig(config)
 	s3Client := blob.ProvideS3Client(config)
 
@@ -58,12 +71,13 @@ func NewReader(config cfg.Config, logger mon.Logger, settings *ReaderSettings) *
 		panic(fmt.Sprintf("Unknown prefix naming strategy '%s'", settings.NamingStrategy))
 	}
 
-	recorder := settings.Recorder
-	if recorder == nil {
-		recorder = NewNopRecorder()
+	r := NewReaderWithInterfaces(logger, s3Cfg, s3Client, settings.ModelId, prefixNaming, NewNopRecorder())
+
+	for _, opt := range opts {
+		opt(r)
 	}
 
-	return NewReaderWithInterfaces(logger, s3Cfg, s3Client, settings.ModelId, prefixNaming, recorder)
+	return r
 }
 
 func NewReaderWithInterfaces(

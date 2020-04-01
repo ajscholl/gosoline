@@ -23,7 +23,14 @@ type WriterSettings struct {
 	ModelId        mdl.ModelId
 	NamingStrategy string
 	Tags           map[string]string
-	Recorder       FileRecorder
+}
+
+type WriterOption func(r *s3Writer)
+
+func WriterRecorder(recorder FileRecorder) WriterOption {
+	return func(r *s3Writer) {
+		r.recorder = recorder
+	}
 }
 
 //go:generate mockery -name Writer
@@ -42,7 +49,7 @@ type s3Writer struct {
 	recorder             FileRecorder
 }
 
-func NewWriter(config cfg.Config, logger mon.Logger, settings *WriterSettings) *s3Writer {
+func NewWriter(config cfg.Config, logger mon.Logger, settings *WriterSettings, opts ...WriterOption) *s3Writer {
 	s3Cfg := blob.GetS3ClientConfig(config)
 	s3Client := blob.ProvideS3Client(config)
 	settings.ModelId.PadFromConfig(config)
@@ -53,12 +60,13 @@ func NewWriter(config cfg.Config, logger mon.Logger, settings *WriterSettings) *
 		logger.Panic(errors.New("unknown naming strategy"), fmt.Sprintf("Unknown prefix naming strategy '%s'", settings.NamingStrategy))
 	}
 
-	recorder := settings.Recorder
-	if recorder == nil {
-		recorder = NewNopRecorder()
+	w := NewWriterWithInterfaces(logger, s3Client, s3Cfg, settings.ModelId, prefixNaming, settings.Tags, NewNopRecorder())
+
+	for _, opt := range opts {
+		opt(w)
 	}
 
-	return NewWriterWithInterfaces(logger, s3Client, s3Cfg, settings.ModelId, prefixNaming, settings.Tags, recorder)
+	return w
 }
 
 func NewWriterWithInterfaces(
