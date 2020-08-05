@@ -2,11 +2,11 @@ package ddb
 
 import (
 	"fmt"
+	"github.com/applike/gosoline/pkg/encoding/json"
 	"github.com/applike/gosoline/pkg/mdl"
 	"github.com/aws/aws-sdk-go/service/dynamodb"
 	"reflect"
 	"strings"
-	"time"
 )
 
 type metadataFactory struct{}
@@ -258,11 +258,17 @@ func ReadAttributes(model interface{}) (Attributes, error) {
 
 		attributeName := *attributeNamePtr
 
+		attributeType, err := getAttributeType(field)
+
+		if err != nil {
+			return nil, err
+		}
+
 		attributes[attributeName] = &Attribute{
 			FieldName:     field.Name,
 			AttributeName: attributeName,
 			Tags:          make(map[string]string),
-			Type:          getAttributeType(field),
+			Type:          attributeType,
 		}
 
 		parts := strings.Split(tag, ",")
@@ -312,32 +318,67 @@ func getAttributeName(field reflect.StructField) (*string, error) {
 	return &jsonTag, nil
 }
 
-func getAttributeType(field reflect.StructField) string {
-	attributeType := ""
-
+func getAttributeType(field reflect.StructField) (string, error) {
 	t := field.Type
 
-	if t.Kind() == reflect.Ptr {
+	for t.Kind() == reflect.Ptr {
 		t = t.Elem()
 	}
 
-	switch t.Kind() {
-	case reflect.String:
-		attributeType = dynamodb.ScalarAttributeTypeS
-	case reflect.Int, reflect.Int64, reflect.Uint, reflect.Uint64, reflect.Float32, reflect.Float64:
-		attributeType = dynamodb.ScalarAttributeTypeN
-	case reflect.Struct:
-		switch t.String() {
-		case reflect.TypeOf(time.Time{}).String():
-			attributeType = dynamodb.ScalarAttributeTypeS
-		default:
-			panic(fmt.Errorf("type %s is not supported for kind of struct for attributeType", t.String()))
-		}
-	default:
-		panic(fmt.Errorf("unknown attributeType for field of kind %s with type %s", t.Kind().String(), t.String()))
+	if fieldType := getDdbType(t.Kind()); fieldType != nil {
+		return *fieldType, nil
 	}
 
-	return attributeType
+	if t.Kind() != reflect.Struct {
+		return "", fmt.Errorf("unknown attributeType for field %s of kind %s with type %s", field.Name, t.Kind().String(), t.String())
+	}
+
+	// try to determine the type of the field by looking at how the value serializes to JSON:
+	// We create an empty value, marshal to json, parse again and see at what type we get back.
+	// This causes for example time.Time to turn into a string (we had a special case for that
+	// before) without us knowing anything about it, so you can also add your own types here.
+
+	v := reflect.Zero(t).Interface()
+	bytes, err := json.Marshal(v)
+
+	if err != nil {
+		return "", fmt.Errorf("attributeType for field %s is a struct of type %s which can not be converted to json: %w", field.Name, t.String(), err)
+	}
+
+	m := map[string]interface{}{}
+	err = json.Unmarshal([]byte(fmt.Sprintf(`{"data":%s}`, string(bytes))), &m)
+
+	if err != nil {
+		return "", fmt.Errorf("attributeType for field %s is a struct of type %s of which the zero value converted to invalid JSON '%s': %w", field.Name, t.String(), string(bytes), err)
+	}
+
+	if fieldType := getDdbType(reflect.ValueOf(m["data"]).Kind()); fieldType != nil {
+		return *fieldType, nil
+	}
+
+	return "", fmt.Errorf("attributeType for field %s is a struct of type %s which parses as something else than a string or number: %T", field.Name, t.String(), m["data"])
+}
+
+func getDdbType(k reflect.Kind) *string {
+	switch k {
+	case reflect.String:
+		return mdl.String(dynamodb.ScalarAttributeTypeS)
+	case reflect.Int,
+		reflect.Int8,
+		reflect.Int16,
+		reflect.Int32,
+		reflect.Int64,
+		reflect.Uint,
+		reflect.Uint8,
+		reflect.Uint16,
+		reflect.Uint32,
+		reflect.Uint64,
+		reflect.Float32,
+		reflect.Float64:
+		return mdl.String(dynamodb.ScalarAttributeTypeN)
+	default:
+		return nil
+	}
 }
 
 func MetadataReadFields(model interface{}) ([]string, error) {
