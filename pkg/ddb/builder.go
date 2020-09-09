@@ -8,6 +8,11 @@ import (
 
 type KeyValues map[string]*dynamodb.AttributeValue
 
+type Keys struct {
+	hashValue  interface{}
+	rangeValue interface{}
+}
+
 type keyBuilder struct {
 	metadata   KeyAware
 	hashValue  interface{}

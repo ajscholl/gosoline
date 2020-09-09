@@ -66,8 +66,9 @@ type repository struct {
 	client   dynamodbiface.DynamoDBAPI
 	executor aws.Executor
 
-	metadata *Metadata
-	settings *Settings
+	keyBuilder keyBuilder
+	metadata   *Metadata
+	settings   *Settings
 }
 
 func NewRepository(config cfg.Config, logger mon.Logger, settings *Settings) Repository {
@@ -122,13 +123,18 @@ func NewWithInterfaces(logger mon.Logger, tracer tracing.Tracer, client dynamodb
 		logger.Fatalf(err, "could not factor metadata for ddb table %s", name)
 	}
 
+	keyBuilder := keyBuilder{
+		metadata: metadata.Main,
+	}
+
 	return &repository{
-		logger:   logger,
-		tracer:   tracer,
-		client:   client,
-		executor: executor,
-		metadata: metadata,
-		settings: settings,
+		logger:     logger,
+		tracer:     tracer,
+		client:     client,
+		executor:   executor,
+		keyBuilder: keyBuilder,
+		metadata:   metadata,
+		settings:   settings,
 	}
 }
 
@@ -190,12 +196,18 @@ func (r *repository) BatchPutItems(ctx context.Context, value interface{}) (*Ope
 	_, span := r.tracer.StartSubSpan(ctx, "ddb.BatchPutItems")
 	defer span.Finish()
 
-	return r.batchWriteItem(ctx, value, func(item map[string]*dynamodb.AttributeValue) *dynamodb.WriteRequest {
+	return r.batchWriteItem(ctx, value, func(item interface{}) (*dynamodb.WriteRequest, error) {
+		marshalledItem, err := dynamodbattribute.MarshalMap(item)
+
+		if err != nil {
+			return nil, fmt.Errorf("could not marshal item for batchWriteItem operation on table %s: %w", r.metadata.TableName, err)
+		}
+
 		return &dynamodb.WriteRequest{
 			PutRequest: &dynamodb.PutRequest{
-				Item: item,
+				Item: marshalledItem,
 			},
-		}
+		}, nil
 	})
 }
 
@@ -203,16 +215,22 @@ func (r *repository) BatchDeleteItems(ctx context.Context, value interface{}) (*
 	_, span := r.tracer.StartSubSpan(ctx, "ddb.BatchDeleteItems")
 	defer span.Finish()
 
-	return r.batchWriteItem(ctx, value, func(item map[string]*dynamodb.AttributeValue) *dynamodb.WriteRequest {
+	return r.batchWriteItem(ctx, value, func(item interface{}) (*dynamodb.WriteRequest, error) {
+		key, err := r.keyBuilder.fromItem(item)
+
+		if err != nil {
+			return nil, fmt.Errorf("could not marshal keys for batchWriteItem operation on table %s: %w", r.metadata.TableName, err)
+		}
+
 		return &dynamodb.WriteRequest{
 			DeleteRequest: &dynamodb.DeleteRequest{
-				Key: item,
+				Key: key,
 			},
-		}
+		}, nil
 	})
 }
 
-func (r *repository) batchWriteItem(ctx context.Context, value interface{}, reqBuilder func(map[string]*dynamodb.AttributeValue) *dynamodb.WriteRequest) (*OperationResult, error) {
+func (r *repository) batchWriteItem(ctx context.Context, value interface{}, reqBuilder func(interface{}) (*dynamodb.WriteRequest, error)) (*OperationResult, error) {
 	items, err := refl.InterfaceToInterfaceSlice(value)
 
 	if err != nil {
@@ -227,13 +245,13 @@ func (r *repository) batchWriteItem(ctx context.Context, value interface{}, reqB
 		requests := make([]*dynamodb.WriteRequest, len(chunk))
 
 		for i := 0; i < len(chunk); i++ {
-			marshalledItem, err := dynamodbattribute.MarshalMap(chunk[i])
+			req, err := reqBuilder(chunk[i])
 
 			if err != nil {
-				return nil, fmt.Errorf("could not marshal item for batchWriteItem operation on table %s: %w", r.metadata.TableName, err)
+				return nil, err
 			}
 
-			requests[i] = reqBuilder(marshalledItem)
+			requests[i] = req
 		}
 
 		input := &dynamodb.BatchWriteItemInput{
