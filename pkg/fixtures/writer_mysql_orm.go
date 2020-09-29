@@ -5,6 +5,7 @@ import (
 	"github.com/applike/gosoline/pkg/cfg"
 	"github.com/applike/gosoline/pkg/db-repo"
 	"github.com/applike/gosoline/pkg/mon"
+	"time"
 )
 
 type mysqlOrmFixtureWriter struct {
@@ -58,6 +59,19 @@ func (m *mysqlOrmFixtureWriter) Write(fs *FixtureSet) error {
 
 	for _, item := range fs.Fixtures {
 		model := item.(db_repo.ModelBased)
+
+		if timestampAware, ok := model.(db_repo.TimestampAware); ok {
+			emptyTime := time.Time{}
+			// clear any timestamps set to time.Time{}, they would get saved as 0000-00-00 00:00:00 in mysql and
+			// that makes it hard to e.g. shovel the data. Instead, clear the data and let gorm fill in the current
+			// time.
+			if createdAt := timestampAware.GetCreatedAt(); createdAt != nil && *createdAt == emptyTime {
+				model.SetCreatedAt(nil)
+			}
+			if updatedAt := timestampAware.GetUpdatedAt(); updatedAt != nil && *updatedAt == emptyTime {
+				model.SetUpdatedAt(timestampAware.GetCreatedAt())
+			}
+		}
 
 		err := m.repo.Update(ctx, model)
 

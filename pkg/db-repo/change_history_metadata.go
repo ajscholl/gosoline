@@ -1,6 +1,7 @@
 package db_repo
 
 import (
+	"fmt"
 	"github.com/jinzhu/gorm"
 	"github.com/thoas/go-funk"
 	"strings"
@@ -19,6 +20,7 @@ type tableMetadata struct {
 	tableNameQuoted string
 	columns         []columnMetadata
 	primaryKeys     []columnMetadata
+	unknownColumns  []columnMetadata
 }
 
 type tableMetadataBuilder struct {
@@ -34,6 +36,7 @@ func (m *tableMetadataBuilder) build() *tableMetadata {
 	metadata.tableNameQuoted = m.scope.Quote(m.tableName)
 	metadata.columns = m.buildColumns()
 	metadata.primaryKeys = m.buildPrimaryKeys()
+	metadata.unknownColumns = m.buildUnknownColumns(metadata.columns, metadata.primaryKeys)
 	return metadata
 }
 
@@ -55,6 +58,67 @@ func (m *tableMetadataBuilder) buildPrimaryKeys() []columnMetadata {
 		}
 	}
 	return columns
+}
+
+type DescribeTableRow struct {
+	Field   string
+	Type    string
+	Null    string
+	Key     string
+	Default *string
+	Extra   string
+}
+
+func (m *tableMetadataBuilder) buildUnknownColumns(columns []columnMetadata, keys []columnMetadata) []columnMetadata {
+	rows, err := m.scope.NewDB().Raw(fmt.Sprintf("DESCRIBE %s", m.scope.Quote(m.tableName))).Rows()
+
+	if err != nil {
+		panic(err)
+	}
+
+	defer rows.Close()
+
+	var unknownColumns []columnMetadata
+	for rows.Next() {
+		row := DescribeTableRow{}
+		err := rows.Scan(&row.Field, &row.Type, &row.Null, &row.Key, &row.Default, &row.Extra)
+
+		if err != nil {
+			panic(err)
+		}
+
+		fieldName := row.Field
+		known := false
+
+		for _, column := range columns {
+			if column.name == fieldName {
+				known = true
+			}
+		}
+		for _, key := range keys {
+			if key.name == fieldName {
+				known = true
+			}
+		}
+
+		if !known {
+			definition := row.Type
+
+			if row.Null == "YES" {
+				definition += " NULL"
+			} else {
+				definition += " NOT NULL"
+			}
+
+			unknownColumns = append(unknownColumns, columnMetadata{
+				exists:     true,
+				name:       fieldName,
+				nameQuoted: m.scope.Quote(fieldName),
+				definition: definition,
+			})
+		}
+	}
+	return unknownColumns
 }
 
 func (m *tableMetadataBuilder) buildColumn(field *gorm.StructField) columnMetadata {

@@ -69,6 +69,17 @@ func (c *changeHistoryManager) runMigration() error {
 		return c.execute()
 	}
 
+	if len(c.historyTable.unknownColumns) > 0 {
+		c.logger.Info("recreating history triggers")
+		c.dropHistoryTriggers()
+		c.createHistoryTriggers()
+		c.logger.Warn("change history table contains unknown columns, fix manually")
+		for _, column := range c.historyTable.unknownColumns {
+			c.logger.Warnf("unknown column: %s %s", column.name, column.definition)
+		}
+		return c.execute()
+	}
+
 	c.logger.Info("change history setup was already up to date")
 
 	return nil
