@@ -36,18 +36,17 @@ type ProducerDaemonSettings struct {
 type ProducerDaemon struct {
 	kernel.EssentialModule
 
-	name          string
-	lck           sync.Mutex
-	logger        mon.Logger
-	metric        mon.MetricWriter
-	aggregate     []WritableMessage
-	batch         []WritableMessage
-	outCh         chan []WritableMessage
-	output        Output
-	tickerFactory clock.TickerFactory
-	ticker        clock.Ticker
-	marshaller    AggregateMarshaller
-	settings      ProducerDaemonSettings
+	name       string
+	lck        sync.Mutex
+	logger     mon.Logger
+	metric     mon.MetricWriter
+	aggregate  []*Message
+	batch      []WritableMessage
+	outCh      chan []WritableMessage
+	output     Output
+	ticker     clock.Ticker
+	marshaller AggregateMarshaller
+	settings   ProducerDaemonSettings
 }
 
 func ProvideProducerDaemon(config cfg.Config, logger mon.Logger, name string) *ProducerDaemon {
@@ -76,31 +75,22 @@ func NewProducerDaemon(config cfg.Config, logger mon.Logger, name string) *Produ
 	}
 
 	output := NewConfigurableOutput(config, logger, settings.Output)
+	ticker := clock.NewRealTicker(settings.Daemon.Interval)
 
-	return &ProducerDaemon{
-		name:          name,
-		logger:        logger,
-		metric:        metric,
-		batch:         make([]WritableMessage, 0, settings.Daemon.BatchSize),
-		outCh:         make(chan []WritableMessage, settings.Daemon.BufferSize),
-		output:        output,
-		tickerFactory: clock.NewRealTicker,
-		marshaller:    MarshalJsonMessage,
-		settings:      settings.Daemon,
-	}
+	return NewProducerDaemonWithInterfaces(logger, metric, output, ticker, MarshalJsonMessage, name, settings.Daemon)
 }
 
-func NewProducerDaemonWithInterfaces(logger mon.Logger, metric mon.MetricWriter, output Output, tickerFactory clock.TickerFactory, marshaller AggregateMarshaller, name string, settings ProducerDaemonSettings) *ProducerDaemon {
+func NewProducerDaemonWithInterfaces(logger mon.Logger, metric mon.MetricWriter, output Output, ticker clock.Ticker, marshaller AggregateMarshaller, name string, settings ProducerDaemonSettings) *ProducerDaemon {
 	return &ProducerDaemon{
-		name:          name,
-		logger:        logger,
-		metric:        metric,
-		batch:         make([]WritableMessage, 0, settings.BatchSize),
-		outCh:         make(chan []WritableMessage, settings.BufferSize),
-		output:        output,
-		tickerFactory: tickerFactory,
-		marshaller:    marshaller,
-		settings:      settings,
+		name:       name,
+		logger:     logger,
+		metric:     metric,
+		batch:      make([]WritableMessage, 0, settings.BatchSize),
+		outCh:      make(chan []WritableMessage, settings.BufferSize),
+		output:     output,
+		ticker:     ticker,
+		marshaller: marshaller,
+		settings:   settings,
 	}
 }
 
@@ -113,8 +103,6 @@ func (d *ProducerDaemon) Boot(_ cfg.Config, _ mon.Logger) error {
 }
 
 func (d *ProducerDaemon) Run(kernelCtx context.Context) error {
-	d.ticker = d.tickerFactory(d.settings.Interval)
-
 	cfn := coffin.New()
 	cfn.GoWithContextf(kernelCtx, d.tickerLoop, "panic during running the ticker loop")
 
@@ -164,8 +152,6 @@ func (d *ProducerDaemon) Write(_ context.Context, batch []WritableMessage) error
 }
 
 func (d *ProducerDaemon) tickerLoop(ctx context.Context) error {
-	var err error
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -175,7 +161,7 @@ func (d *ProducerDaemon) tickerLoop(ctx context.Context) error {
 		case <-d.ticker.Tick():
 			d.lck.Lock()
 
-			if err = d.flushAll(); err != nil {
+			if err := d.flushAll(); err != nil {
 				d.logger.Error(err, "can not flush all messages")
 			}
 
@@ -186,16 +172,31 @@ func (d *ProducerDaemon) tickerLoop(ctx context.Context) error {
 
 func (d *ProducerDaemon) applyAggregation(batch []WritableMessage) ([]WritableMessage, error) {
 	if d.settings.AggregationSize <= 1 {
+		// we are not aggregating, forward messages as they are
 		return batch, nil
 	}
 
-	d.aggregate = append(d.aggregate, batch...)
+	newBatch := make([]WritableMessage, 0)
 
-	if len(d.aggregate) < d.settings.AggregationSize {
-		return nil, nil
+	for _, msg := range batch {
+		if streamMsg, ok := msg.(*Message); ok {
+			d.aggregate = append(d.aggregate, streamMsg)
+		} else {
+			newBatch = append(newBatch, msg)
+		}
 	}
 
-	return d.flushAggregate()
+	if len(d.aggregate) < d.settings.AggregationSize {
+		return newBatch, nil
+	}
+
+	aggregated, err := d.flushAggregate()
+
+	if err != nil {
+		return nil, err
+	}
+
+	return append(newBatch, aggregated...), nil
 }
 
 func (d *ProducerDaemon) flushAggregate() ([]WritableMessage, error) {
@@ -209,7 +210,7 @@ func (d *ProducerDaemon) flushAggregate() ([]WritableMessage, error) {
 		size = len(d.aggregate)
 	}
 
-	var readyAggregate []WritableMessage
+	var readyAggregate []*Message
 	readyAggregate, d.aggregate = d.aggregate[:size], d.aggregate[size:]
 
 	d.writeMetricAggregateSize(len(readyAggregate))
@@ -266,10 +267,8 @@ func (d *ProducerDaemon) close() error {
 }
 
 func (d *ProducerDaemon) outputLoop(ctx context.Context) error {
-	var err error
-
 	for batch := range d.outCh {
-		if err = d.output.Write(ctx, batch); err != nil {
+		if err := d.output.Write(ctx, batch); err != nil {
 			d.logger.Errorf(err, "can not write messages to output in producer %s", d.name)
 		}
 
@@ -347,7 +346,7 @@ func getProducerDaemonDefaultMetrics(name string) mon.MetricData {
 	}
 }
 
-func BuildAggregateMessage(marshaller AggregateMarshaller, aggregate []WritableMessage) (WritableMessage, error) {
+func BuildAggregateMessage(marshaller AggregateMarshaller, aggregate []*Message) (WritableMessage, error) {
 	return marshaller(aggregate, map[string]interface{}{
 		AttributeAggregate: true,
 	})
