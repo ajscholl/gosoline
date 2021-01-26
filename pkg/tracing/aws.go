@@ -7,6 +7,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws/client"
 	"github.com/aws/aws-xray-sdk-go/xray"
 	"github.com/aws/aws-xray-sdk-go/xraylog"
+	"strings"
 )
 
 func AWS(config cfg.Config, c *client.Client) {
@@ -30,14 +31,21 @@ func newXrayLogger(logger mon.Logger) *xrayLogger {
 }
 
 func (x xrayLogger) Log(level xraylog.LogLevel, msg fmt.Stringer) {
+	msgStr := msg.String()
+
 	switch level {
 	case xraylog.LogLevelDebug:
-		x.logger.Debug(msg)
+		if strings.HasPrefix(msgStr, "{") {
+			// debug statement at github.com/aws/aws-xray-sdk-go@v1.1.0/xray/default_emitter.go:67 logging the packet itself
+			x.logger.Infof("about to send packet '%s'", msgStr)
+		} else {
+			x.logger.Debug(msgStr)
+		}
 	case xraylog.LogLevelInfo:
-		x.logger.Info(msg)
+		x.logger.Info(msgStr)
 	case xraylog.LogLevelWarn:
-		x.logger.Warn(msg)
+		x.logger.Warn(msgStr)
 	case xraylog.LogLevelError:
-		x.logger.Error(fmt.Errorf(msg.String()), msg.String())
+		x.logger.Error(fmt.Errorf(msgStr), msgStr)
 	}
 }
